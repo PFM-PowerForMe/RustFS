@@ -1,0 +1,191 @@
+name: 'PFM-Custom-Container-Build'
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '编译版本'
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      tag:
+        description: '编译版本'
+        required: true
+        type: string
+      
+
+permissions: write-all
+
+jobs:
+  Custom-Container-Build:
+    name: '容器编译'
+    strategy:
+      matrix:
+        include:
+          - platform: linux/amd64
+            os: ubuntu-latest
+          - platform: linux/arm64
+            os: ubuntu-24.04-arm
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    outputs:
+      image_name: ${{ steps.work_env.outputs.image_name }}
+      platform_pair: ${{ steps.work_env.outputs.platform_pair }}
+      arch: ${{ steps.work_env.outputs.arch }}
+      cpu_arch: ${{ steps.work_env.outputs.cpu_arch }}
+    steps:
+      - name: '环境变量'
+        id: work_env
+        run: |
+          repo=${{ github.event.repository.name }}
+          platform=${{ matrix.platform }}
+          echo "image_name=${repo,,}" >> ${GITHUB_OUTPUT}
+          echo "IMAGE_NAME=${repo,,}" >> ${GITHUB_ENV}
+          echo "platform_pair=${platform//\//-}" >> ${GITHUB_OUTPUT}
+          echo "PLATFORM_PAIR=${platform//\//-}" >> ${GITHUB_ENV}
+          echo "arch=${platform#*/}" >> ${GITHUB_OUTPUT}
+          echo "ARCH=${platform#*/}" >> ${GITHUB_ENV}
+          echo "GH=${{ vars.GHCR_REPO }}/${repo,,}" >> ${GITHUB_ENV}
+          echo "CPU_ARCH=$(arch)" >> ${GITHUB_ENV}
+          echo "cpu_arch=$(arch)" >> ${GITHUB_OUTPUT}
+
+      - name: '检出分支'
+        id: checkout
+        uses: actions/checkout@v4
+        with:
+          ref: workflow
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: '设置容器编译工具'
+        uses: docker/setup-buildx-action@v3
+        with:
+          version: latest
+          cache-binary: true
+          cleanup: true
+          platforms: ${{ matrix.platform }}
+          buildkitd-config-inline: |
+            [worker.oci]
+              max-parallelism = 8
+          driver-opts: |
+            network=host
+
+      - name: '登录GHCR'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: '容器meta'
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ${{ env.GH }}
+          tags: |
+            type=raw,value=latest-${{ env.ARCH }},enable=true
+          labels: |
+            org.opencontainers.image.title=${{ env.IMAGE_NAME }}
+            org.opencontainers.image.description=PFM-PowerForMe container - ${{ env.IMAGE_NAME }}.
+            org.opencontainers.image.vendor=PFM
+            org.opencontainers.image.authors=PFM
+            org.opencontainers.image.licenses=MIT
+          annotations: |
+            org.opencontainers.image.title=${{ env.IMAGE_NAME }}
+            org.opencontainers.image.description=PFM-PowerForMe container - ${{ env.IMAGE_NAME }}.
+            org.opencontainers.image.vendor=PFM
+            org.opencontainers.image.authors=PFM
+            org.opencontainers.image.licenses=MIT
+
+      - name: '编译并发布'
+        id: build
+        uses: docker/build-push-action@v6
+        env:
+          DOCKER_BUILD_RECORD_UPLOAD: false
+        with:
+          platforms: ${{ matrix.platform }}
+          provenance: false
+          cache-from: type=registry,ref=${{ env.GH }}:latest
+          cache-to: type=inline
+          context: containers
+          file: containers/Dockerfile
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: |
+            type=image,name=${{ env.GH }},push-by-digest=true,name-canonical=true,push=true
+          build-args: |
+            TAG=${{ inputs.tag }}
+
+      - name: '导出 digest'
+        run: |
+          mkdir -p ${{ runner.temp }}/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+
+      - name: '上传 artifact'
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ env.PLATFORM_PAIR }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  Merge-Container:
+    name: '容器合并'
+    needs: Custom-Container-Build
+    runs-on: ubuntu-latest
+    env:
+      GH: ${{ vars.GHCR_REPO }}/${{ needs.Custom-Container-Build.outputs.image_name }}
+    steps:
+      - name: '下载 digests'
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - name: '设置容器编译工具'
+        uses: docker/setup-buildx-action@v3
+
+      - name: '登录GHCR'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: '创建并发布多架构 manifest'
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          docker buildx imagetools create \
+            --annotation "index:org.opencontainers.image.description=PFM-PowerForMe container" \
+            --annotation "index:org.opencontainers.image.authors=PFM" \
+            --annotation "index:org.opencontainers.image.vendor=PFM" \
+            --annotation "index:org.opencontainers.image.licenses=MIT" \
+            --annotation "manifest-descriptor:org.opencontainers.image.description=PFM-PowerForMe container" \
+            --annotation "manifest-descriptor:org.opencontainers.image.authors=PFM" \
+            --annotation "manifest-descriptor:org.opencontainers.image.vendor=PFM" \
+            --annotation "manifest-descriptor:org.opencontainers.image.licenses=MIT" \
+            -t ${{ env.GH }}:latest \
+           $(printf '${{ env.GH }}@sha256:%s ' *)
+           
+      - name: '检查容器'
+        run: |
+          docker buildx imagetools inspect ${{ env.GH }}:latest
+
+  Clean-Container:
+    name: 'GHCR清理'
+    needs: [Custom-Container-Build, Merge-Container]
+    runs-on: ubuntu-latest
+    env:
+      IMAGE_NAME: ${{ needs.Custom-Container-Build.outputs.image_name }}
+
+    steps:
+      - name: '清理GHCR容器镜像'
+        uses: actions/delete-package-versions@v5
+        with: 
+          package-name: ${{ env.IMAGE_NAME }}
+          package-type: 'container'
+          min-versions-to-keep: 30
+          delete-only-untagged-versions: 'true'
